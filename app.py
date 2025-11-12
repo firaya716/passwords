@@ -1,164 +1,139 @@
-import json
-from flask import Flask, request, session, redirect, url_for, render_template, jsonify
-import random
-import string
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key'
+app.secret_key = 'your_secret_key_here'  # Замените на ваш секретный ключ
 
-users = {}
-saved_passwords = {}
+DATABASE = 'data.db'
 
-def load_data():
-    global users, saved_passwords
-    try:
-        with open('users.json', 'r', encoding='utf-8') as f:
-            users = json.load(f)
-    except:
-        users = {}
-    try:
-        with open('saved_passwords.json', 'r', encoding='utf-8') as f:
-            saved_passwords = json.load(f)
-    except:
-        saved_passwords = {}
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def save_data():
-    with open('users.json', 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=4)
-    with open('saved_passwords.json', 'w', encoding='utf-8') as f:
-        json.dump(saved_passwords, f, ensure_ascii=False, indent=4)
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS saved_passwords (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            site TEXT NOT NULL,
+            login TEXT NOT NULL,
+            password TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
+init_db()
 
-def create_password(length, uppercase, lowercase, numbers, special):
-    chars = ''
-    if uppercase:
-        chars += string.ascii_uppercase
-    if lowercase:
-        chars += string.ascii_lowercase
-    if numbers:
-        chars += string.digits
-    if special:
-        chars += string.punctuation
+@app.route('/')
+def index():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+    user_id = session['user_id']
 
-    if not chars:
-        chars = string.ascii_letters + string.digits + string.punctuation
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('SELECT site, login, password FROM saved_passwords WHERE user_id = ?', (user_id,))
+    passwords = c.fetchall()
+    conn.close()
 
-    return ''.join(random.choice(chars) for _ in range(length))
+    return render_template('index.html', passwords=passwords)
 
-#Авторизация
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if 'username' in session:
-        return redirect(url_for('home'))
-
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
-
-        if username in users and users[username] == password:
-            session['username'] = username
-            return redirect(url_for('home'))
-        else:
-            return "Неверный логин или пароль", 401
-
-    return render_template('login.html')
-
-#Регистрация
 @app.route('/register', methods=['GET', 'POST'])
 def register():
-    if 'username' in session:
-        return redirect(url_for('home'))
-
     if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+        username = request.form['username'].strip()
+        password = request.form['password']
 
         if not username or not password:
-            return "Введите имя пользователя и пароль", 400
-        if username in users:
-            return "Пользователь уже существует", 400
+            flash('Пожалуйста, заполните все поля')
+            return redirect(url_for('register'))
 
-        users[username] = password
-        saved_passwords[username] = []
-        save_data()
-        session['username'] = username
-        return redirect(url_for('home'))
+        hashed_password = generate_password_hash(password)
+
+        conn = get_db()
+        c = conn.cursor()
+        try:
+            c.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, hashed_password))
+            conn.commit()
+            flash('Регистрация прошла успешно! Войдите в систему.')
+            return redirect(url_for('login'))
+        except sqlite3.IntegrityError:
+            flash('Пользователь с таким именем уже существует!')
+            return redirect(url_for('register'))
+        finally:
+            conn.close()
 
     return render_template('register.html')
 
-#Выход
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username'].strip()
+        password = request.form['password']
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT id, password FROM users WHERE username = ?', (username,))
+        user = c.fetchone()
+        conn.close()
+
+        if user and check_password_hash(user['password'], password):
+            session['user_id'] = user['id']
+            session['username'] = username
+            flash('Успешный вход')
+            return redirect(url_for('index'))
+        else:
+            flash('Неверное имя пользователя или пароль')
+            return redirect(url_for('login'))
+
+    return render_template('login.html')
+
 @app.route('/logout')
 def logout():
-    session.pop('username', None)
+    session.clear()
+    flash('Вы вышли из системы')
     return redirect(url_for('login'))
-
-#Главная страница
-@app.route('/')
-def home():
-    if 'username' not in session:
-        return redirect(url_for('login'))
-
-    user = session['username']
-    user_passwords = saved_passwords.get(user, [])
-    return render_template('index.html', passwords=user_passwords)
-
 
 @app.route('/save_password', methods=['POST'])
 def save_password():
-    if 'username' not in session:
-        return jsonify({'error': 'Вы не вошли в систему'}), 401
+    if 'user_id' not in session:
+        flash('Требуется вход в систему')
+        return redirect(url_for('login'))
 
-    data = request.get_json()
-    site = data.get('site')
-    login = data.get('login')
-    password = data.get('password')
+    site = request.form['site'].strip()
+    login_ = request.form['login'].strip()
+    password = request.form['password'].strip()
 
-    if not site or not login or not password:
-        return jsonify({'error': 'Заполните все поля'}), 400
+    if not site or not login_ or not password:
+        flash ('Заполните все поля')
+        return redirect(url_for('index'))
 
-    user = session['username']
-    saved_passwords.setdefault(user, []).append({
-        'site': site,
-        'login': login,
-        'password': password
-    })
-    save_data()
-    return jsonify({'message': 'Данные сохранены!'})
+    user_id = session['user_id']
 
-#Генерация
-@app.route('/generate', methods=['POST'])
-def generate():
-    if 'username' not in session:
-        return jsonify({'error': 'Пользователь не авторизован'}), 401
+    conn = get_db()
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO saved_passwords (user_id, site, login, password) VALUES (?, ?, ?, ?)',
+        (user_id, site, login_, password)
+    )
+    conn.commit()
+    conn.close()
 
-    data = request.get_json()
-    try:
-        length = int(data.get('length', 12))
-        if length < 4:
-            length = 4
-        elif length > 50:
-            length = 50
-
-        uppercase = data.get('uppercase', True)
-        lowercase = data.get('lowercase', True)
-        numbers = data.get('numbers', True)
-        special = data.get('special', True)
-
-        password = create_password(length, uppercase, lowercase, numbers, special)
-
-        user = session['username']
-        saved_passwords.setdefault(user, []).append({
-            'site': 'generated_password',
-            'login': '',
-            'password': password
-        })
-        save_data()
-
-        return jsonify({'password': password})
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 400
+    flash('Пароль успешно сохранён')
+    return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    load_data()
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug, host, port)
