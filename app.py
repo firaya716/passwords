@@ -136,4 +136,4 @@ def save_password():
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    app.run(debug, host, port)
+    app.run(debug=True)
